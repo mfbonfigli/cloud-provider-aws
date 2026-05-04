@@ -274,10 +274,10 @@ var _ = Describe("[cloud-provider-aws-e2e] loadbalancer", func() {
 				DeferCleanup(func(ctx context.Context) {
 					if cfg.byoSecurityGroupID != "" {
 						framework.Logf("Cleaning up BYO security group: %s", cfg.byoSecurityGroupID)
-						framework.Logf("Waiting 30s for ENIs to be detached from security group...")
-						time.Sleep(30 * time.Second)
-						err := deleteSecurityGroup(ctx, cfg.byoSecurityGroupID)
-						framework.ExpectNoError(err, "Failed to delete BYO security group")
+						framework.Logf("Waiting for ENIs to be detached from security group...")
+						gomega.Eventually(ctx, func() error {
+							return deleteSecurityGroup(ctx, cfg.byoSecurityGroupID)
+						}, 2*time.Minute, 5*time.Second).Should(gomega.Succeed(), "Failed to delete BYO security group")
 						framework.Logf("✓ Deleted BYO security group: %s", cfg.byoSecurityGroupID)
 					}
 				})
@@ -334,10 +334,10 @@ var _ = Describe("[cloud-provider-aws-e2e] loadbalancer", func() {
 				DeferCleanup(func(ctx context.Context) {
 					if cfg.byoSecurityGroupID != "" {
 						framework.Logf("Cleaning up BYO security group: %s", cfg.byoSecurityGroupID)
-						framework.Logf("Waiting 30s for ENIs to be detached from security group...")
-						time.Sleep(30 * time.Second)
-						err := deleteSecurityGroup(ctx, cfg.byoSecurityGroupID)
-						framework.ExpectNoError(err, "Failed to delete BYO security group")
+						framework.Logf("Waiting for ENIs to be detached from security group...")
+						gomega.Eventually(ctx, func() error {
+							return deleteSecurityGroup(ctx, cfg.byoSecurityGroupID)
+						}, 2*time.Minute, 5*time.Second).Should(gomega.Succeed(), "Failed to delete BYO security group after waiting for ENI detachment")
 						framework.Logf("✓ Deleted BYO security group: %s", cfg.byoSecurityGroupID)
 					}
 				})
@@ -368,32 +368,25 @@ var _ = Describe("[cloud-provider-aws-e2e] loadbalancer", func() {
 				cfg.svc = newSvc
 				framework.Logf("Updated service with BYO SG annotation: %s=%s", annotationLBSecurityGroups, cfg.byoSecurityGroupID)
 
-				// Wait for controller to process the update
-				time.Sleep(15 * time.Second)
-
-				// Step 3: Verify NLB now has BYO SG and managed SG is deleted
-				framework.Logf("Step 3: Verifying NLB now has BYO SG and managed SG is deleted")
-				byoSGs, err := getLoadBalancerSecurityGroups(cfg.ctx, lbDNS)
-				framework.ExpectNoError(err, "Failed to get load balancer security groups after BYO annotation")
-				framework.Logf("NLB %s has security groups after BYO annotation: %+v", lbDNS, byoSGs)
-
-				if len(byoSGs) != 1 {
-					framework.Failf("Expected NLB to have exactly 1 security group (BYO SG), got %d: %v", len(byoSGs), byoSGs)
-				}
-				if byoSGs[0] != cfg.byoSecurityGroupID {
-					framework.Failf("Expected NLB to have BYO SG %q, got %q", cfg.byoSecurityGroupID, byoSGs[0])
-				}
+				// Step 3: Wait for controller to process the update and verify NLB now has BYO SG
+				framework.Logf("Step 3: Waiting for controller to update NLB security groups and verifying BYO SG is attached")
+				gomega.Eventually(cfg.ctx, func() ([]string, error) {
+					return getLoadBalancerSecurityGroups(cfg.ctx, lbDNS)
+				}, 2*time.Minute, 5*time.Second).Should(gomega.And(
+					gomega.HaveLen(1),
+					gomega.ContainElement(cfg.byoSecurityGroupID),
+				), "NLB should have exactly 1 security group (BYO SG) after annotation update")
 				framework.Logf("✓ Verified: NLB has only the BYO SG attached: %s", cfg.byoSecurityGroupID)
 
 				// Verify managed SG was deleted
 				framework.Logf("Verifying managed SG %s was deleted", managedSGID)
-				_, err = getSecurityGroup(cfg.ctx, managedSGID)
-				if err == nil {
-					framework.Failf("Expected managed SG %s to be deleted, but it still exists", managedSGID)
-				}
-				if !strings.Contains(err.Error(), "InvalidGroup.NotFound") {
-					framework.Failf("Error checking if managed SG was deleted: %v", err)
-				}
+				gomega.Eventually(cfg.ctx, func() error {
+					_, err := getSecurityGroup(cfg.ctx, managedSGID)
+					return err
+				}, 2*time.Minute, 5*time.Second).Should(gomega.And(
+					gomega.HaveOccurred(),
+					gomega.MatchError(gomega.ContainSubstring("InvalidGroup.NotFound")),
+				), "Managed SG should be deleted after transition to BYO SG")
 				framework.Logf("✓ Verified: Managed SG %s was deleted", managedSGID)
 			},
 		},
@@ -423,10 +416,10 @@ var _ = Describe("[cloud-provider-aws-e2e] loadbalancer", func() {
 				DeferCleanup(func(ctx context.Context) {
 					if cfg.byoSecurityGroupID != "" {
 						framework.Logf("Cleaning up BYO security group: %s", cfg.byoSecurityGroupID)
-						framework.Logf("Waiting 30s for ENIs to be detached from security group...")
-						time.Sleep(30 * time.Second)
-						err := deleteSecurityGroup(ctx, cfg.byoSecurityGroupID)
-						framework.ExpectNoError(err, "Failed to delete BYO security group")
+						framework.Logf("Waiting for ENIs to be detached from security group...")
+						gomega.Eventually(ctx, func() error {
+							return deleteSecurityGroup(ctx, cfg.byoSecurityGroupID)
+						}, 2*time.Minute, 5*time.Second).Should(gomega.Succeed(), "Failed to delete BYO security group after waiting for ENI detachment")
 						framework.Logf("✓ Deleted BYO security group: %s", cfg.byoSecurityGroupID)
 					}
 				})
@@ -462,31 +455,32 @@ var _ = Describe("[cloud-provider-aws-e2e] loadbalancer", func() {
 				cfg.svc = newSvc
 				framework.Logf("Removed BYO SG annotation from service")
 
-				// Wait for controller to process the update
-				time.Sleep(15 * time.Second)
-
-				// Step 3: Verify NLB now has new managed SG and BYO SG is deassociated but still exists
-				framework.Logf("Step 3: Verifying NLB has new managed SG and BYO SG is deassociated")
-				managedSGs, err := getLoadBalancerSecurityGroups(cfg.ctx, lbDNS)
-				framework.ExpectNoError(err, "Failed to get load balancer security groups after removing BYO annotation")
-				framework.Logf("NLB %s has security groups after removing BYO annotation: %+v", lbDNS, managedSGs)
-
-				if len(managedSGs) == 0 {
-					framework.Failf("Expected NLB to have at least 1 new managed security group, got 0")
-				}
-				managedSGID := managedSGs[0]
-				if managedSGID == cfg.byoSecurityGroupID {
-					framework.Failf("Expected NLB to have a new managed SG, but it still has the BYO SG: %s", cfg.byoSecurityGroupID)
-				}
-				framework.Logf("✓ Verified: NLB has new managed SG: %s", managedSGID)
+				// Step 3: Wait for controller to process the update and verify NLB has new managed SG
+				framework.Logf("Step 3: Waiting for controller to update NLB security groups and verifying new managed SG is attached")
+				err = wait.PollUntilContextTimeout(cfg.ctx, 5*time.Second, 2*time.Minute, true, func(ctx context.Context) (bool, error) {
+					managedSGs, err := getLoadBalancerSecurityGroups(cfg.ctx, lbDNS)
+					if err != nil {
+						framework.Logf("Failed to get load balancer security groups: %v", err)
+						return false, nil
+					}
+					if len(managedSGs) == 0 {
+						framework.Logf("No security groups attached yet")
+						return false, nil
+					}
+					if managedSGs[0] == cfg.byoSecurityGroupID {
+						framework.Logf("Still has BYO SG attached")
+						return false, nil
+					}
+					framework.Logf("NLB %s has security groups after removing BYO annotation: %+v", lbDNS, managedSGs)
+					return true, nil
+				})
+				framework.ExpectNoError(err, "Failed waiting for NLB to get new managed SG")
 
 				// Verify BYO SG still exists but is not attached
 				framework.Logf("Verifying BYO SG %s still exists", cfg.byoSecurityGroupID)
 				byoSG, err := getSecurityGroup(cfg.ctx, cfg.byoSecurityGroupID)
 				framework.ExpectNoError(err, "Failed to get BYO security group")
-				if byoSG == nil {
-					framework.Failf("Expected BYO SG %s to still exist, but it was deleted", cfg.byoSecurityGroupID)
-				}
+				gomega.Expect(byoSG).ToNot(gomega.BeNil(), "BYO SG should still exist after transition to managed SG")
 				framework.Logf("✓ Verified: BYO SG %s still exists and was not deleted", cfg.byoSecurityGroupID)
 			},
 		},
