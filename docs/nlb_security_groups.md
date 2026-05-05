@@ -4,7 +4,8 @@
 
 The controller can be configured to enable managed Security Group (SG) for Services using AWS Network Load Balancer (NLB) by setting an opt-in configuration in your cloud config. When enabled, each NLB created for a Kubernetes Service of type `LoadBalancer` with annotation `service.beta.kubernetes.io/aws-load-balancer-type=nlb` will have a dedicated Security Group, managed by the cloud provider controller. We are calling this as opt-in Managed NLB Security Group ("Managed SG" mode).
 
-> Note: The BYO SG (user-provided security groups) annotation `service.beta.kubernetes.io/aws-load-balancer-security-groups` is supported for both Classic Load Balancers and Network Load Balancers (requires `NLBSecurityGroupMode = Managed` for NLB). When managed mode is disabled for NLB, this annotation is ignored. The annotation `service.beta.kubernetes.io/aws-load-balancer-extra-security-groups` is valid only for Classic Load Balancers. To learn more about supported annotations by load balancer type, see the [service_controller documentation][doc-ctrl-service].
+> Note 1: The BYO SG (user-provided security groups) annotation `service.beta.kubernetes.io/aws-load-balancer-security-groups` is supported for both Classic Load Balancers and Network Load Balancers (requires `NLBSecurityGroupMode = Managed` for NLB). When managed mode is disabled for NLB, this annotation is ignored. 
+> Note 2: The annotation `service.beta.kubernetes.io/aws-load-balancer-extra-security-groups` is valid only for Classic Load Balancers. To learn more about supported annotations by load balancer type, see the [service_controller documentation][doc-ctrl-service].
 
 [doc-ctrl-service]: https://github.com/kubernetes/cloud-provider-aws/blob/master/docs/service_controller.md
 
@@ -165,7 +166,7 @@ aws elbv2 describe-load-balancers --load-balancer-arns $LB_ARN \
 aws ec2 describe-security-groups --group-ids $BYO_SG_ID \
   --query 'SecurityGroups[0].Tags' --output json
 
-# Should NOT contain kubernetes.io/cluster/<cluster-name>: owned tag
+# Should NOT contain the key-value pair: kubernetes.io/cluster/<cluster-name>: owned tag
 ```
 
 4. Delete the Service and verify the BYO security group is NOT deleted:
