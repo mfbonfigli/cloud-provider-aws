@@ -1943,6 +1943,42 @@ func (c *Cloud) buildSecurityGroupRuleReferences(ctx context.Context, sgID strin
 	return groupsHasTags, groupsLinkedPermissions, nil
 }
 
+// revokeSecurityGroupReferences revokes ingress rules from cluster-tagged security groups
+// that reference the specified security group. This prevents dangling references when
+// a security group is detached or deleted.
+//
+// Parameters:
+// - `ctx`: The context for the operation.
+// - `sg`: The security group ID whose references should be revoked.
+//
+// Returns:
+// - `error`: An error if building references or revoking rules fails.
+func (c *Cloud) revokeSecurityGroupReferences(ctx context.Context, sg string) error {
+	groupsWithClusterTag, groupsLinkedPermissions, err := c.buildSecurityGroupRuleReferences(ctx, sg)
+	if err != nil {
+		return fmt.Errorf("error building security group rule references for %q: %w", sg, err)
+	}
+
+	// Revoke ingress rules referencing the security group from cluster-tagged security groups.
+	// Security groups without the cluster tag are skipped (assumed to be user-managed).
+	for sgTarget, sgPerms := range groupsLinkedPermissions {
+		if !groupsWithClusterTag[sgTarget] {
+			klog.V(2).Infof("security group %q has no cluster tag, skipping rule revocation", aws.ToString(sgTarget.GroupId))
+			continue
+		}
+
+		klog.V(2).Infof("revoking security group ingress references of %q from %q", sg, aws.ToString(sgTarget.GroupId))
+		if _, err := c.ec2.RevokeSecurityGroupIngress(ctx, &ec2.RevokeSecurityGroupIngressInput{
+			GroupId:       sgTarget.GroupId,
+			IpPermissions: sgPerms.List(),
+		}); err != nil {
+			return fmt.Errorf("error revoking security group ingress rules from %q: %w", aws.ToString(sgTarget.GroupId), err)
+		}
+	}
+
+	return nil
+}
+
 // removeOwnedSecurityGroups removes the CLB owned/managed security groups from AWS.
 // It revokes ingress rules that reference the security groups to be removed,
 // then deletes the security groups that are owned by the controller.
@@ -1967,29 +2003,11 @@ func (c *Cloud) removeOwnedSecurityGroups(ctx context.Context, loadBalancerName 
 			continue
 		}
 
-		groupsWithClusterTag, groupsLinkedPermissions, err := c.buildSecurityGroupRuleReferences(ctx, sg)
-		if err != nil {
-			allErrs = append(allErrs, fmt.Errorf("error building security group rule references for %q: %w", sg, err))
-			continue
-		}
-
 		// Revoke ingress rules referencing the security group to be deleted
-		// from cluster-tagged security groups, when the referenced security
-		// group has no cluster tag, skip the revoke assuming it is user-managed.
-		for sgTarget, sgPerms := range groupsLinkedPermissions {
-			if !groupsWithClusterTag[sgTarget] {
-				klog.Warningf("security group %q has no cluster tag, skipping remove lifecycle after update", sg)
-				continue
-			}
-
-			klog.V(2).Infof("revoking security group ingress references of %q from %q", sg, aws.ToString(sgTarget.GroupId))
-			if _, err := c.ec2.RevokeSecurityGroupIngress(ctx, &ec2.RevokeSecurityGroupIngressInput{
-				GroupId:       sgTarget.GroupId,
-				IpPermissions: sgPerms.List(),
-			}); err != nil {
-				allErrs = append(allErrs, fmt.Errorf("error revoking security group ingress rules from %q: %w", aws.ToString(sgTarget.GroupId), err))
-				continue
-			}
+		// from cluster-tagged security groups.
+		if err := c.revokeSecurityGroupReferences(ctx, sg); err != nil {
+			allErrs = append(allErrs, err)
+			continue
 		}
 
 		// Skip security group removal when the security group is not owned by the controller.
