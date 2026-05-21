@@ -33,14 +33,22 @@ import (
 )
 
 const (
-	ccmDaemonSetName       = "aws-cloud-controller-manager"
-	ccmNamespace           = "kube-system"
-	ccmLabelSelector       = "k8s-app=aws-cloud-controller-manager"
-	defaultCloudConfigPath = "/etc/kubernetes/cloud.config"
-	tempConfigMapName      = "aws-cloud-config-e2e"
+	// ccmDaemonSetName is the name of the CCM DaemonSet in kube-system namespace.
+	ccmDaemonSetName = "aws-cloud-controller-manager"
+	// ccmNamespace is the namespace where CCM daemonset is deployed by kops.
+	ccmNamespace = "kube-system"
+	// ccmLabelSelector is the label selector to identify CCM pods.
+	ccmLabelSelector = "k8s-app=aws-cloud-controller-manager"
+	// tempConfigMapName is the name used for the injected config map with the modified cloud config.
+	tempConfigMapName = "aws-cloud-config-e2e"
+	// defaultRestartTimeout is the default timeout for waiting for CCM pods to restart and become ready after config changes.
+	defaultRestartTimeout = 3 * time.Minute
+	// pollInterval is the interval for polling pod readiness after CCM restart.
+	pollInterval = 5 * time.Second
 )
 
 // cloudConfigManager helps to change the CCM cloud configuration for e2e tests.
+// It is engineered to work with kops-provisioned clusters that run CI tests.
 // It modifies the CCM cloud config at runtime by creating a temporary ConfigMap and
 // patching the DaemonSet to use it instead of the original hostPath volume.
 type cloudConfigManager struct {
@@ -67,7 +75,7 @@ func withRestartTimeout(timeout time.Duration) cloudConfigManagerOption {
 // newCloudConfigManager creates a new CCM cloud config manager with the provided options.
 func newCloudConfigManager(opts ...cloudConfigManagerOption) *cloudConfigManager {
 	m := &cloudConfigManager{
-		restartTimeout: 3 * time.Minute,
+		restartTimeout: defaultRestartTimeout,
 	}
 
 	// Apply options
@@ -82,7 +90,7 @@ func newCloudConfigManager(opts ...cloudConfigManagerOption) *cloudConfigManager
 // configuration state for later restoration.
 //
 // Steps:
-//   - Validates that CCM is using hostPath (not ConfigMap)
+//   - Finds the cloud-config path from CCM args
 //   - Creates a temporary ConfigMap with the desired config
 //   - Patches the CCM DaemonSet to use the ConfigMap instead of hostPath
 //   - Adds subPath to volumeMount to mount ConfigMap key as a file
@@ -108,6 +116,11 @@ func (m *cloudConfigManager) setCloudConfig(ctx context.Context, cs clientset.In
 		return fmt.Errorf("CCM DaemonSet has no containers")
 	}
 	cloudConfigPath := getCloudConfigPath(ds.Spec.Template.Spec.Containers[0])
+
+	// Check if CCM actually uses a cloud config. If not, return an error as it's an unsupported scenario.
+	if cloudConfigPath == "" {
+		return fmt.Errorf("CCM does not use --cloud-config flag")
+	}
 	framework.Logf("Cloud config path from CCM args: %s", cloudConfigPath)
 
 	// Find the volume and volumeMount for cloud config
@@ -116,13 +129,13 @@ func (m *cloudConfigManager) setCloudConfig(ctx context.Context, cs clientset.In
 		return err
 	}
 
-	// Verify it's hostPath-based (only hostPath is supported)
+	// Verify it's hostPath-based
 	if m.originalVolume.HostPath == nil {
-		return fmt.Errorf("CCM cloud config is not hostPath-based (only hostPath configs are supported, not ConfigMap-based)")
+		return fmt.Errorf("CCM cloud config is not hostPath-based (only hostPath configs are supported)")
 	}
 	framework.Logf("Current config mount: HostPath=%s", m.originalVolume.HostPath.Path)
 
-	// Create ConfigMap and patch DaemonSet
+	// Create ConfigMap and patch DaemonSet. This also stores a copy of the original volume for later restoration.
 	if err := m.createConfigMapAndPatchDaemonSet(ctx, cs, ds, volumeIdx, configContent); err != nil {
 		return err
 	}
@@ -131,27 +144,25 @@ func (m *cloudConfigManager) setCloudConfig(ctx context.Context, cs clientset.In
 	return restartCCMPods(ctx, cs, m.restartTimeout)
 }
 
-// restoreCloudConfig restores the original CCM cloud configuration as saved by the last call to setCloudConfig.
+// restoreCloudConfig restores the original CCM cloud configuration as saved by setCloudConfig.
 // This restores the hostPath volume and deletes the temporary ConfigMap.
 func (m *cloudConfigManager) restoreCloudConfig(ctx context.Context, cs clientset.Interface) error {
 	framework.Logf("=== Restoring original CCM configuration ===")
 
 	ds, err := cs.AppsV1().DaemonSets(ccmNamespace).Get(ctx, ccmDaemonSetName, metav1.GetOptions{})
 	if err != nil {
-		framework.Logf("Warning: Failed to get DaemonSet: %v", err)
-		return nil // Non-fatal
+		return fmt.Errorf("failed to get DaemonSet: %w", err)
 	}
 
 	if m.originalVolume == nil {
-		framework.Logf("Warning: No original volume to restore")
-		return nil
+		return fmt.Errorf("no original volume to restore")
 	}
 
 	// Restore original volume
 	for i, vol := range ds.Spec.Template.Spec.Volumes {
 		if vol.Name == m.originalVolume.Name {
 			ds.Spec.Template.Spec.Volumes[i] = *m.originalVolume
-			framework.Logf("✓ Restored original volume: %s", m.originalVolume.Name)
+			framework.Logf("Restored original volume: %s", m.originalVolume.Name)
 			break
 		}
 	}
@@ -162,7 +173,7 @@ func (m *cloudConfigManager) restoreCloudConfig(ctx context.Context, cs clientse
 			for j, mount := range container.VolumeMounts {
 				if mount.Name == m.originalVolume.Name {
 					ds.Spec.Template.Spec.Containers[i].VolumeMounts[j] = *m.originalVolumeMount
-					framework.Logf("✓ Restored original volumeMount")
+					framework.Logf("Restored original volumeMount")
 					break
 				}
 			}
@@ -172,28 +183,24 @@ func (m *cloudConfigManager) restoreCloudConfig(ctx context.Context, cs clientse
 	// Update DaemonSet
 	_, err = cs.AppsV1().DaemonSets(ccmNamespace).Update(ctx, ds, metav1.UpdateOptions{})
 	if err != nil {
-		framework.Logf("Warning: Failed to restore DaemonSet: %v", err)
-		return nil // Non-fatal
+		return fmt.Errorf("failed to restore DaemonSet: %w", err)
 	}
-	framework.Logf("✓ Restored DaemonSet to use hostPath")
+	framework.Logf("Restored DaemonSet to use hostPath")
 
 	// Delete temporary ConfigMap
 	err = cs.CoreV1().ConfigMaps(ccmNamespace).Delete(ctx, tempConfigMapName, metav1.DeleteOptions{})
-	if err != nil {
-		framework.Logf("Warning: Failed to delete ConfigMap: %v", err)
-		return nil // Non-fatal
+	if err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("failed to delete ConfigMap: %w", err)
 	}
-	framework.Logf("✓ Deleted temporary ConfigMap %s", tempConfigMapName)
+	framework.Logf("Deleted temporary ConfigMap %s", tempConfigMapName)
 
 	// Restart CCM pods to load original config
 	return restartCCMPods(ctx, cs, m.restartTimeout)
 }
 
 // getCloudConfigPath extracts the cloud config path from CCM container arguments.
-// Returns the default path if --cloud-config flag is not found.
+// Returns empty string if --cloud-config flag is not found.
 func getCloudConfigPath(container v1.Container) string {
-	cloudConfigPath := defaultCloudConfigPath
-
 	for i, arg := range container.Args {
 		if arg == "--cloud-config" && i+1 < len(container.Args) {
 			return container.Args[i+1]
@@ -202,7 +209,7 @@ func getCloudConfigPath(container v1.Container) string {
 		}
 	}
 
-	return cloudConfigPath
+	return "" // No cloud-config flag found
 }
 
 // findCloudConfigVolume locates the volume and volumeMount for the cloud config in the CCM DaemonSet.
@@ -237,14 +244,7 @@ func (m *cloudConfigManager) findCloudConfigVolume(ds *appsv1.DaemonSet, cloudCo
 		if vol.Name == volumeName {
 			volumeIdx = i
 			m.originalVolume = vol.DeepCopy()
-			framework.Logf("Found cloud config volume: name=%s, type=%s", vol.Name, func() string {
-				if vol.ConfigMap != nil {
-					return "ConfigMap"
-				} else if vol.HostPath != nil {
-					return "HostPath"
-				}
-				return "Unknown"
-			}())
+			framework.Logf("Found cloud config volume: name=%s, type=%s", vol.Name, getVolumeType(vol))
 			return volumeName, volumeIdx, nil
 		}
 	}
@@ -269,9 +269,20 @@ func (m *cloudConfigManager) createConfigMapAndPatchDaemonSet(ctx context.Contex
 	}
 	_, err := cs.CoreV1().ConfigMaps(ccmNamespace).Create(ctx, cm, metav1.CreateOptions{})
 	if err != nil {
-		return fmt.Errorf("failed to create ConfigMap: %w", err)
+		if apierrors.IsAlreadyExists(err) {
+			// ConfigMap already exists, update it
+			framework.Logf("ConfigMap %s already exists, updating...", tempConfigMapName)
+			_, err = cs.CoreV1().ConfigMaps(ccmNamespace).Update(ctx, cm, metav1.UpdateOptions{})
+			if err != nil {
+				return fmt.Errorf("failed to update existing ConfigMap: %w", err)
+			}
+			framework.Logf("Updated ConfigMap %s with key '%s'", tempConfigMapName, m.configMapKey)
+		} else {
+			return fmt.Errorf("failed to create ConfigMap: %w", err)
+		}
+	} else {
+		framework.Logf("Created ConfigMap %s with key '%s'", tempConfigMapName, m.configMapKey)
 	}
-	framework.Logf("✓ Created ConfigMap %s with key '%s'", tempConfigMapName, m.configMapKey)
 
 	// Patch DaemonSet volume to use ConfigMap
 	ds.Spec.Template.Spec.Volumes[volumeIdx] = v1.Volume{
@@ -295,7 +306,7 @@ func (m *cloudConfigManager) createConfigMapAndPatchDaemonSet(ctx context.Contex
 				m.originalVolumeMount = mount.DeepCopy()
 				// Add subPath to mount ConfigMap key as file
 				ds.Spec.Template.Spec.Containers[i].VolumeMounts[j].SubPath = m.configMapKey
-				framework.Logf("✓ Added subPath=%s to volumeMount", m.configMapKey)
+				framework.Logf("Added subPath=%s to volumeMount", m.configMapKey)
 				break
 			}
 		}
@@ -305,7 +316,7 @@ func (m *cloudConfigManager) createConfigMapAndPatchDaemonSet(ctx context.Contex
 	if err != nil {
 		return fmt.Errorf("failed to update DaemonSet: %w", err)
 	}
-	framework.Logf("✓ Patched DaemonSet to use ConfigMap")
+	framework.Logf("Patched DaemonSet to use ConfigMap")
 
 	return nil
 }
@@ -331,7 +342,7 @@ func restartCCMPods(ctx context.Context, cs clientset.Interface, timeout time.Du
 
 	// Wait for new pods to be Running AND Ready
 	framework.Logf("Waiting for CCM pods to become ready (timeout: %v)", timeout)
-	err = wait.PollUntilContextTimeout(ctx, 5*time.Second, timeout, true, func(ctx context.Context) (bool, error) {
+	err = wait.PollUntilContextTimeout(ctx, pollInterval, timeout, true, func(ctx context.Context) (bool, error) {
 		pods, err := cs.CoreV1().Pods(ccmNamespace).List(ctx, metav1.ListOptions{
 			LabelSelector: ccmLabelSelector,
 		})
@@ -359,7 +370,17 @@ func restartCCMPods(ctx context.Context, cs clientset.Interface, timeout time.Du
 	if err != nil {
 		return fmt.Errorf("CCM pods did not become ready within %v: %w", timeout, err)
 	}
-	framework.Logf("✓ CCM restarted successfully")
+	framework.Logf("CCM restarted successfully")
 
 	return nil
+}
+
+// getVolumeType returns a string describing the type of volume.
+func getVolumeType(vol v1.Volume) string {
+	if vol.ConfigMap != nil {
+		return "ConfigMap"
+	} else if vol.HostPath != nil {
+		return "HostPath"
+	}
+	return "Unknown"
 }

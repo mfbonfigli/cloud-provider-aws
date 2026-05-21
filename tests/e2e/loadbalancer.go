@@ -635,7 +635,7 @@ var managedSgModeNLBTests = []loadBalancerTestCases{
 }
 
 // execute load balancer tests
-var _ = Describe("[cloud-provider-aws-e2e] loadbalancer", func() {
+var _ = Describe("[cloud-provider-aws-e2e]", func() {
 	f := framework.NewDefaultFramework("cloud-provider-aws")
 	f.NamespacePodSecurityEnforceLevel = admissionapi.LevelPrivileged
 
@@ -653,15 +653,9 @@ var _ = Describe("[cloud-provider-aws-e2e] loadbalancer", func() {
 		// After each test
 	})
 
-	// Context 1: Default context. Run all tests.
-	// This includes tests requiring NLBSecurityGroupMode=Managed (cluster default)
-	// Runs:
-	// - CLB tests, as they are not tied to any particular NLBSecurityGroupMode setting
-	// - NLB tests that are not specific to security group configuration (generic NLB functionality tests) as they are cross
-	//   cutting for all NLBSecurityGroupMode settings.
-	// - NLB tests that require NLBSecurityGroupMode=Managed as they require managed mode to be enabled to pass
-	Context("", func() {
-		// CLB tests (not NLB-related)
+	// run all load balancer tests with the default configuration
+	Context("loadbalancer", func() {
+		// CLB tests
 		for _, tc := range clbTests {
 			It(tc.name, func(ctx context.Context) {
 				runTestCase(ctx, tc, cs, ns)
@@ -683,15 +677,8 @@ var _ = Describe("[cloud-provider-aws-e2e] loadbalancer", func() {
 		}
 	})
 
-	// Context 2: Runs tests with NLBManagedMode disabled via cloud config override
-	// Ensures NLB functionality works as expected even when NLBSecurityGroupMode=Managed is disabled.
-	//
-	// It excludes the following tests:
-	// - CLB tests are not included because they are already executed in Context 1 and are not tied to any specific NLBManagedMode.
-	// - NLB Tests requiring NLBSecurityGroupMode=Managed because they do not fit the scope.
-	//
-	// Tests are Serial and Ordered because to run they modify CCM configuration and should not interfere with other tests.
-	Context("[nlb-sg-managed-mode-disabled]", Serial, Ordered, Label("nlb-sg-managed-mode-disabled"), func() {
+	// Run relevant NLB tests with NLBSecurityGroupMode disabled via cloud config override
+	Context("[nlb-security-group-mode-disabled] loadbalancer", Serial, Ordered, func() {
 		cloudConfigMgr := newCloudConfigManager(withRestartTimeout(3 * time.Minute))
 
 		BeforeAll(func(ctx context.Context) {
